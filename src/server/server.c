@@ -9,10 +9,38 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <sys/time.h>
+
+#ifdef CLUSTER_ENABLED
+#include "cluster/conf.h"
+#include "cluster/cluster.h"
+#endif
 
 #define DEFAULT_PORT 6379
 #define BUFFER_SIZE  4096
 #define MAX_ARGS     4
+
+#ifdef CLUSTER_ENABLED
+static cluster_state_t *g_cs = NULL;
+static char g_my_id[16] = {0};
+static void load_or_create_nodeid(const char *base, int port) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s.%d", base, port);
+    FILE *fp = fopen(path, "r");
+    if (fp) {
+        if (fgets(g_my_id, sizeof(g_my_id), fp)) {
+            g_my_id[strcspn(g_my_id, "\r\n")] = '\0';
+        }
+        fclose(fp);
+        return;
+    }
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    snprintf(g_my_id, sizeof(g_my_id), "n%05x", (int)(tv.tv_usec % 0x100000));
+    fp = fopen(path, "w");
+    if (fp) { fprintf(fp, "%s\n", g_my_id); fclose(fp); }
+}
+#endif
 
 static kv_table_t *g_db = NULL;
 static int g_running = 1;
@@ -44,10 +72,29 @@ static void process_command(int fd, char *line) {
     if (argc == 0) return;
 
     if (strcasecmp(args[0], "SET") == 0 && argc >= 3) {
-        if (kv_set(g_db, args[1], args[2]) == 0)
+        char **keys = NULL;
+        size_t kcount = 0;
+        /* Ritorna metadata per replica */
+        char *key = args[1];
+        char *val = args[2];
+        if (kv_set(g_db, key, val) == 0) {
             send_reply(fd, "OK");
-        else
+#ifdef CLUSTER_ENABLED
+            if (g_cs) {
+                kv_meta_t meta;
+                char dummy_val[1];
+                char *check = kv_get_meta(g_db, key, &meta);
+                if (check) {
+                    memcpy(meta.origin, g_my_id, 15);
+                    meta.origin[15] = '\0';
+                    cluster_replicate_set(g_cs, key, val, &meta);
+                    free(check);
+                }
+            }
+#endif
+        } else {
             send_reply(fd, "ERR");
+        }
     } else if (strcasecmp(args[0], "GET") == 0 && argc >= 2) {
         char *val = kv_get(g_db, args[1]);
         if (val) {
@@ -58,8 +105,20 @@ static void process_command(int fd, char *line) {
         }
     } else if (strcasecmp(args[0], "DEL") == 0 && argc >= 2) {
         int ok = 0;
-        for (int i = 1; i < argc; ++i)
+        for (int i = 1; i < argc; ++i) {
             if (kv_del(g_db, args[i]) == 0) ok++;
+#ifdef CLUSTER_ENABLED
+            if (g_cs && ok) {
+                uint64_t v = kv_next_version(g_db);
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                uint64_t wc = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+                kv_meta_t meta = {v, wc, ""};
+                memcpy(meta.origin, g_my_id, 15); meta.origin[15] = '\0';
+                cluster_replicate_del(g_cs, args[i], &meta);
+            }
+#endif
+        }
         char out[64];
         snprintf(out, sizeof(out), "%d", ok);
         send_reply(fd, out);
@@ -160,6 +219,10 @@ static void *client_thread(void *arg) {
 int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     const char *path = NULL;
+#ifdef CLUSTER_ENABLED
+    const char *cluster_conf_path = NULL;
+    int cluster_bus_port = 0;
+#endif
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
@@ -167,6 +230,13 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             path = argv[++i];
         }
+#ifdef CLUSTER_ENABLED
+        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            cluster_conf_path = argv[++i];
+        } else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc) {
+            cluster_bus_port = atoi(argv[++i]);
+        }
+#endif
     }
 
     g_db = kv_open(path);
@@ -177,6 +247,26 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_sigint);
     signal(SIGPIPE, SIG_IGN);
+
+#ifdef CLUSTER_ENABLED
+    if (cluster_conf_path) {
+        load_or_create_nodeid(path ? path : "./.nodeid", port);
+        cluster_conf_t *cfg = cluster_conf_load(cluster_conf_path, port, cluster_bus_port ? cluster_bus_port : port + 10000);
+        if (!cfg) {
+            fprintf(stderr, "Errore nel caricamento cluster config\n");
+            kv_close(g_db);
+            return 1;
+        }
+        g_cs = cluster_init(cfg, g_db);
+        if (!g_cs) {
+            fprintf(stderr, "Errore nell'inizializzazione cluster\n");
+            cluster_conf_free(cfg);
+            kv_close(g_db);
+            return 1;
+        }
+        printf("Cluster enabled. My ID: %s\n", g_my_id);
+    }
+#endif
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
@@ -212,6 +302,9 @@ int main(int argc, char **argv) {
     }
 
     close(srv);
+#ifdef CLUSTER_ENABLED
+    if (g_cs) cluster_shutdown(g_cs);
+#endif
     kv_close(g_db);
     return 0;
 }

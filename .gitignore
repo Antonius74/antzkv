@@ -1,0 +1,4 @@
+build/
+.nodeid
+.nodeid.*
+test/.nodeid

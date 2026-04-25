@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <editline/readline.h>
 
 #define BUFFER_SIZE 4096
 
@@ -63,7 +64,7 @@ int main(int argc, char **argv) {
     }
 
     if (i < argc) {
-        /* Modalità non-interattiva: ricostruisco la riga di comando */
+        /* Modalità non-interattiva */
         int sock = connect_server(host, port);
         if (sock < 0) { perror("connect"); return 1; }
         char cmd[BUFFER_SIZE];
@@ -80,23 +81,33 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* Modalità interattiva */
+    /* Modalità interattiva con readline e history */
     int sock = connect_server(host, port);
     if (sock < 0) { perror("connect"); return 1; }
-    printf("Connesso a %s:%d. Digita i comandi (QUIT per uscire).\n", host, port);
+    printf("Connesso a %s:%d.\nDigita i comandi (QUIT per uscire).\n", host, port);
 
-    char line[BUFFER_SIZE];
     char resp[BUFFER_SIZE];
     while (1) {
-        printf("kvdb> ");
-        fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) break;
-        line[strcspn(line, "\n")] = '\0';
-        if (strlen(line) == 0) continue;
-        if (send_cmd(sock, line) < 0) break;
+        char *line = readline("kvdb> ");
+        if (!line) break; /* EOF (Ctrl+D) */
+
+        if (strlen(line) == 0) {
+            free(line);
+            continue;
+        }
+
+        add_history(line);
+
+        if (send_cmd(sock, line) < 0) {
+            free(line);
+            break;
+        }
         if (recv_line(sock, resp, sizeof(resp)) >= 0)
             printf("%s\n", resp);
-        if (strncasecmp(line, "QUIT", 4) == 0) break;
+
+        int is_quit = (strncasecmp(line, "QUIT", 4) == 0);
+        free(line);
+        if (is_quit) break;
     }
     close(sock);
     return 0;

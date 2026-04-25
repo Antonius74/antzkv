@@ -2,20 +2,25 @@
 
 `antzkv` is a lightweight, in-memory / file-persisted **key-value database** inspired by Redis, written in portable **C11** with POSIX threads. It supports concurrent client access over TCP, a simple text-line protocol, and both interactive and non-interactive CLI modes.
 
+**New in cluster branch:** multi-node replication with automatic mesh networking, Last-Write-Wins conflict resolution, and configurable per-node persistence.
+
 ---
 
 ## Table of Contents
 
 1. [Technical Overview](#1-technical-overview)
 2. [Architecture](#2-architecture)
-3. [API / Wire Protocol](#3-api--wire-protocol)
-4. [Build](#4-build)
-5. [User Manual](#5-user-manual)
-   1. [Server Options](#51-server-options)
-   2. [CLI Options](#52-cli-options)
-   3. [Command Reference](#53-command-reference)
-6. [Testing](#6-testing)
-7. [License](#7-license)
+3. [Cluster Mode](#3-cluster-mode)
+   1. [Configuration](#31-configuration)
+   2. [Replication Model](#32-replication-model)
+4. [API / Wire Protocol](#4-api--wire-protocol)
+5. [Build](#5-build)
+6. [User Manual](#6-user-manual)
+   1. [Server Options](#61-server-options)
+   2. [CLI Options](#62-cli-options)
+   3. [Command Reference](#63-command-reference)
+7. [Testing](#7-testing)
+8. [License](#8-license)
 
 ---
 
@@ -27,6 +32,7 @@
 * **Persistence**: optional append-rewrite style binary file (custom format).
 * **Protocol**: plain TCP, newline-terminated text commands and replies.
 * **Default port**: `6379`
+* **Clustering** (new): mesh TCP overlay, heartbeat-based failure detection, async replication.
 
 ---
 
@@ -40,13 +46,19 @@
 │   └── kvdb.h          # Public C API
 ├── src/
 │   ├── core/
-│   │   └── kvdb.c      # Hash table + persistence engine
+│   │   └── kvdb.c      # Hash table + persistence engine (with metadata)
 │   ├── server/
-│   │   └── server.c    # TCP server, one thread per client
-│   └── cli/
-│       └── cli.c       # Interactive / one-shot client
+│   │   └── server.c    # TCP server, one thread per client, cluster integration
+│   ├── cli/
+│   │   └── cli.c       # Interactive / one-shot client (readline support)
+│   └── cluster/
+│       ├── conf.h/c    # Cluster config parser
+│       └── cluster.h/c # Mesh networking, heartbeat, replication, full sync
 ├── test/
 │   └── run_test.sh     # End-to-end functional test suite
+│   └── run_cluster_test.sh  # Cluster integration test
+├── tests/
+│   └── test_kvdb.c     # Unit tests
 ├── build/              # Build artifacts
 ├── Makefile
 └── README.md
@@ -58,8 +70,8 @@ The data layer is fully decoupled from networking.
 
 | Structure | Purpose |
 |-----------|---------|
-| `kv_entry` | One bucket: `key`, `value`, `state` (EMPTY, OCCUPIED, DELETED). |
-| `kv_table` | Hash table: buckets array, metadata, optional `path`, `pthread_rwlock_t`. |
+| `kv_entry` | One bucket: `key`, `value`, `state` (EMPTY, OCCUPIED, DELETED), **plus metadata** (`version`, `wallclock`, `origin`). |
+| `kv_table` | Hash table: buckets array, metadata, optional `path`, `pthread_rwlock_t`, atomic logical clock. |
 
 **Hash function**: FNV-1a 64-bit.
 **Collision resolution**: quadratic probing (`idx = (h0 + i²) mod M`).
@@ -69,6 +81,9 @@ The data layer is fully decoupled from networking.
 * `SET` / `DEL` → `wrlock`
 * `GET` / `EXISTS` / `KEYS` / `SAVE` → `rdlock`
 * Each client runs in a detached `pthread`; locks guarantee serialisation of conflicting operations while allowing parallel reads.
+
+**Conflict resolution (cluster mode)**:
+Every write carries a monotonic `version` (Lamport-like), `wallclock`, and `origin` node-id. When a replica arrives, the database applies **Last-Write-Wins**: higher `version` wins; tie on `version` → higher `wallclock`; tie again → lexical `origin` ID.
 
 ### 2.3 Persistence Format
 
@@ -81,9 +96,12 @@ for each key-value:
     key_bytes    : char[key_len]
     value_len    : size_t
     value_bytes  : char[value_len]
+    version      : uint64_t
+    wallclock    : uint64_t
+    origin       : char[15]
 ```
 
-On `kv_open()`, the file is read and every entry is re-inserted via `kv_set()`, rebuilding the in-memory hash table.
+On `kv_open()`, the file is read and every entry is re-inserted via `kv_set_meta()`, rebuilding the in-memory hash table with full metadata.
 
 ### 2.4 Networking (`server.c`)
 
@@ -98,10 +116,47 @@ On `kv_open()`, the file is read and every entry is re-inserted via `kv_set()`, 
 * Opens a TCP socket to the server.
 * **Non-interactive mode**: all positional arguments after `-h` / `-p` options are joined with spaces and sent as one command.
 * **Interactive mode**: reads from `stdin`, sends the line, waits for one reply line, prints it, then shows `kvdb> ` again.
+* Uses **GNU readline / libedit** for history, line editing, and graceful EOF (`Ctrl+D`).
 
 ---
 
-## 3. API / Wire Protocol
+## 3. Cluster Mode
+
+`antzkv-server` can join a **replicated cluster** by supplying a configuration file with the node list. Any write (`SET`/`DEL`) is asynchronously propagated to all known peers.
+
+### 3.1 Configuration
+
+Create a `cluster.conf` file:
+
+```conf
+# One line per node
+id=alpha host=192.168.1.10 port=6379:16380 replicate=disk
+id=beta  host=192.168.1.11 port=6379:16380 replicate=memory
+id=gamma host=192.168.1.12 port=6379:16380 replicate=auto
+```
+
+| Field | Description |
+|-------|-------------|
+| `id` | Unique node identifier (max 15 chars). Used in conflict resolution. |
+| `host` | IP address or hostname. |
+| `port` | `client_port:cluster_port`. `client_port` is for normal clients; `cluster_port` is the internal mesh bus. |
+| `replicate` | `disk` = persists to `-f` file; `memory` = in-memory only; `auto` = inherits local `-f` setting. |
+
+**Node self-discovery**: the server identifies its own entry by matching its startup client port (`-p`) against the `port=` field.
+
+### 3.2 Replication Model
+
+* **Topology**: full mesh. Every node connects to every other node.
+* **Transport**: independent TCP connections on `cluster_port`.
+* **Heartbeat**: every 500 ms; node marked dead after 2 s of silence.
+* **Replication**: asynchronous. Writes are queued in a ring buffer and dispatched by a background thread.
+* **Consistency**: eventual consistency with **Last-Write-Wins**.
+* **Sync on join**: when an incoming peer is recognised, it can request a `SYNC_REQ`; the responding node streams the entire keyspace via `SNAPSHOT` / `SET` messages.
+* **Node IDs**: each server persists a unique ID in `.nodeid.<port>` in the working directory.
+
+---
+
+## 4. API / Wire Protocol
 
 All interactions are **plain text over TCP**. Every command and every reply is a single line terminated by `\n` (the carriage return `\r`, if present, is stripped).
 
@@ -142,12 +197,13 @@ Server closes socket.
 
 ---
 
-## 4. Build
+## 5. Build
 
 Requirements:
 * GCC or Clang with C11 support
 * POSIX threads (`pthread`)
 * GNU Make
+* GNU readline / libedit (for the CLI)
 
 ```bash
 cd /Users/antoniolatela/Documents/antz/kvdb
@@ -155,47 +211,56 @@ make
 ```
 
 Output binaries:
-* `build/antzkv-server`
-* `build/antzkv-cli`
+* `build/antzkv-server` – compiled with cluster support (`-DCLUSTER_ENABLED`)
+* `build/antzkv-cli`     – client with readline
 
 Clean:
 ```bash
 make clean
 ```
 
-Run the test suite:
+Run the test suites:
 ```bash
-make test
+make test           # functional standalone tests
+bash test/run_cluster_test.sh   # cluster integration tests
 ```
 
 ---
 
-## 5. User Manual
+## 6. User Manual
 
-### 5.1 Server Options
+### 6.1 Server Options
 
 ```bash
-./build/antzkv-server [-p PORT] [-f FILE]
+./build/antzkv-server [-p PORT] [-f FILE] [-c CLUSTER_CONF] [-C CLUSTER_PORT]
 ```
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `-p PORT` | `6379` | TCP listening port. |
-| `-f FILE` | (none) | Optional binary persistence file. If the file exists it is loaded on startup; it is overwritten on `SAVE` or graceful shutdown. |
+| `-p PORT` | `6379` | TCP listening port for clients. |
+| `-f FILE` | (none) | Optional binary persistence file. |
+| `-c FILE` | (none) | **Cluster configuration file** (see §3.1). |
+| `-C PORT` | `client_port + 10000` | Port for internal cluster bus. |
 
 **Examples**
 
 ```bash
-# In-memory only
+# Standalone, in-memory only
 ./build/antzkv-server
 
-# Listen on port 4000 with disk persistence
-./build/antzkv-server -p 4000 -f /var/lib/antzkv.dat
+# With disk persistence
+./build/antzkv-server -f /var/lib/antzkv.dat
+
+# Cluster node alpha (disk)
+./build/antzkv-server -p 6379 -f alpha.db -c cluster.conf -C 16380
+
+# Cluster node beta (memory only)
+./build/antzkv-server -p 6379 -c cluster.conf -C 16380
 ```
 
 Stop the server with **`Ctrl+C`** (SIGINT). The database is automatically saved before exit when a file path is configured.
 
-### 5.2 CLI Options
+### 6.2 CLI Options
 
 ```bash
 ./build/antzkv-cli [-h HOST] [-p PORT] [COMMAND ...]
@@ -236,7 +301,8 @@ If no command is given, the client starts an **interactive REPL**.
 ```
 
 ```text
-Connesso a 127.0.0.1:6379. Digita i comandi (QUIT per uscire).
+Connesso a 127.0.0.1:6379.
+Digita i comandi (QUIT per uscire).
 kvdb> SET name Alice
 OK
 kvdb> GET name
@@ -251,7 +317,7 @@ kvdb> QUIT
 OK
 ```
 
-### 5.3 Command Reference
+### 6.3 Command Reference
 
 | Command | Args | Description | Reply |
 |---------|------|-------------|-------|
@@ -266,8 +332,9 @@ OK
 
 ---
 
-## 6. Testing
+## 7. Testing
 
+### Standalone tests
 A complete Bash-driven functional test suite lives in `test/run_test.sh`. It exercises:
 
 * Basic CRUD (`SET`, `GET`, `DEL`)
@@ -279,13 +346,29 @@ A complete Bash-driven functional test suite lives in `test/run_test.sh`. It exe
 * Concurrent stress test (20 parallel `SET`s immediately followed by `GET`s)
 * Full persistence cycle (write, save, restart, verify)
 
-All tests pass with zero errors:
 ```bash
 make test
 ```
 
+### Cluster tests
+The script `test/run_cluster_test.sh` spawns a two-node local cluster, performs writes on one node, and verifies replication on the other (including bidirectional traffic and `DEL` propagation).
+
+```bash
+bash test/run_cluster_test.sh
+```
+
+### Unit tests
+```bash
+gcc -O2 -Wall -Wextra -Iinclude -pthread tests/test_kvdb.c build/core/kvdb.o -o build/test_kvdb
+./build/test_kvdb
+```
+
 ---
 
-## 7. License
+## 8. License
 
 This project is released for internal use. Modify and redistribute freely.
+
+---
+
+*Branch: `cluster` — cluster support, async replication, LWW conflict resolution.*
