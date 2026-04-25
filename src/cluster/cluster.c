@@ -185,14 +185,12 @@ static void *hb_thread(void *arg) {
         /* cleanup dead peers */
         uint64_t now = msec_now();
         pthread_rwlock_wrlock(&cs->peers_lock);
-        cluster_peer_t **prev = &cs->peers;
         p = cs->peers;
         while (p) {
             if (p->alive && now - p->last_seen > CLUSTER_DEAD_MS) {
                 p->alive = 0;
                 if (p->fd >= 0) { close(p->fd); p->fd = -1; }
             }
-            prev = &p->next;
             p = p->next;
         }
         pthread_rwlock_unlock(&cs->peers_lock);

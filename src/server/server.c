@@ -72,9 +72,6 @@ static void process_command(int fd, char *line) {
     if (argc == 0) return;
 
     if (strcasecmp(args[0], "SET") == 0 && argc >= 3) {
-        char **keys = NULL;
-        size_t kcount = 0;
-        /* Ritorna metadata per replica */
         char *key = args[1];
         char *val = args[2];
         if (kv_set(g_db, key, val) == 0) {
@@ -82,7 +79,6 @@ static void process_command(int fd, char *line) {
 #ifdef CLUSTER_ENABLED
             if (g_cs) {
                 kv_meta_t meta;
-                char dummy_val[1];
                 char *check = kv_get_meta(g_db, key, &meta);
                 if (check) {
                     memcpy(meta.origin, g_my_id, 15);
