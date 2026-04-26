@@ -154,6 +154,58 @@ id=gamma host=192.168.1.12 port=6379:16380 replicate=auto
 * **Sync on join**: when an incoming peer is recognised, it can request a `SYNC_REQ`; the responding node streams the entire keyspace via `SNAPSHOT` / `SET` messages.
 * **Node IDs**: each server persists a unique ID in `.nodeid.<port>` in the working directory.
 
+### 3.3 Convenience scripts
+
+Two helper scripts are provided:
+
+| Script | Purpose |
+|--------|---------|
+| `start-cluster.sh` | Spawn multiple nodes automatically from a config file |
+| `stop-cluster.sh`  | Gracefully kill all nodes started by `start-cluster.sh` |
+
+#### `start-cluster.sh`
+
+```bash
+./start-cluster.sh [--memory|--disk] [NODES] [CONFIG_FILE]
+```
+
+| Flag / Arg | Default | Description |
+|------------|---------|-------------|
+| `--memory` | **default** | All nodes run in-memory only (no files) |
+| `--disk`   |             | Each node persists to its own `<id>.db` file |
+| `NODES`    | `3`         | Number of nodes to spawn |
+| `CONFIG`   | `cluster.conf` | Path to the cluster config file (auto-generated if missing) |
+
+**Examples**
+
+```bash
+# 3 nodes in-memory (default)
+./start-cluster.sh
+
+# 5 nodes with disk persistence
+./start-cluster.sh --disk 5
+
+# Custom config
+./start-cluster.sh --memory 3 /path/to/my-cluster.conf
+```
+
+Output example:
+```
+Generated cluster.conf with 3 node(s) in memory mode
+  Node 'alpha'  client=6301  cluster=17301
+  Node 'beta'   client=6302  cluster=17302
+  Node 'gamma'  client=6303  cluster=17303
+All nodes started. Logs: logs/*.log
+```
+
+#### `stop-cluster.sh`
+
+```bash
+./stop-cluster.sh
+```
+
+Kills all servers whose PIDs were recorded by `start-cluster.sh`.
+
 ---
 
 ## 4. API / Wire Protocol
