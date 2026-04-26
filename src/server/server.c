@@ -23,7 +23,7 @@
 #ifdef CLUSTER_ENABLED
 static cluster_state_t *g_cs = NULL;
 static char g_my_id[16] = {0};
-static void load_or_create_nodeid(const char *base, int port) {
+static void load_or_create_nodeid_from_config(const char *base, int port, const char *id_from_config) {
     char path[256];
     snprintf(path, sizeof(path), "%s.%d", base, port);
     FILE *fp = fopen(path, "r");
@@ -32,11 +32,23 @@ static void load_or_create_nodeid(const char *base, int port) {
             g_my_id[strcspn(g_my_id, "\r\n")] = '\0';
         }
         fclose(fp);
+        if (id_from_config && strcmp(g_my_id, id_from_config) != 0) {
+            /* config changed, update */
+            strncpy(g_my_id, id_from_config, 15);
+            g_my_id[15] = '\0';
+            fp = fopen(path, "w");
+            if (fp) { fprintf(fp, "%s\n", g_my_id); fclose(fp); }
+        }
         return;
     }
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    snprintf(g_my_id, sizeof(g_my_id), "n%05x", (int)(tv.tv_usec % 0x100000));
+    if (id_from_config && id_from_config[0]) {
+        strncpy(g_my_id, id_from_config, 15);
+        g_my_id[15] = '\0';
+    } else {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        snprintf(g_my_id, sizeof(g_my_id), "n%05x", (int)(tv.tv_usec % 0x100000));
+    }
     fp = fopen(path, "w");
     if (fp) { fprintf(fp, "%s\n", g_my_id); fclose(fp); }
 }
@@ -246,13 +258,17 @@ int main(int argc, char **argv) {
 
 #ifdef CLUSTER_ENABLED
     if (cluster_conf_path) {
-        load_or_create_nodeid(path ? path : "./.nodeid", port);
         cluster_conf_t *cfg = cluster_conf_load(cluster_conf_path, port, cluster_bus_port ? cluster_bus_port : port + 10000);
         if (!cfg) {
             fprintf(stderr, "Errore nel caricamento cluster config\n");
             kv_close(g_db);
             return 1;
         }
+        const char *my_id = "";
+        if (cfg->my_node >= 0 && (size_t)cfg->my_node < cfg->node_count) {
+            my_id = cfg->nodes[cfg->my_node].id;
+        }
+        load_or_create_nodeid_from_config(path ? path : "./.nodeid", port, my_id);
         g_cs = cluster_init(cfg, g_db);
         if (!g_cs) {
             fprintf(stderr, "Errore nell'inizializzazione cluster\n");
