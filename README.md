@@ -20,7 +20,9 @@
    2. [CLI Options](#62-cli-options)
    3. [Command Reference](#63-command-reference)
 7. [Testing](#7-testing)
-8. [License](#8-license)
+8. [Client Libraries](#8-client-libraries)
+9. [Performance](#9-performance)
+10. [License](#10-license)
 
 ---
 
@@ -420,6 +422,118 @@ gcc -O2 -Wall -Wextra -Iinclude -pthread tests/test_kvdb.c build/core/kvdb.o -o 
 ## 8. License
 
 This project is released for internal use. Modify and redistribute freely.
+
+---
+
+## 8. Client Libraries
+
+Native **thread-safe** client libraries are provided for **Python** and **Java**. They use pure TCP sockets — no CLI subprocesses.
+
+### 8.1 Python
+
+```python
+from antzkv import AntzKVClient
+
+with AntzKVClient("127.0.0.1", 6379) as client:
+    assert client.set("name", "Alice")
+    print(client.get("name"))          # Alice
+    print(client.delete("name"))       # 1
+    print(client.keys())               # []
+```
+
+**Pipeline (batch operations)** — recommended for high throughput:
+
+```python
+pairs = [(f"k{i}", f"v{i}") for i in range(100)]
+results = client.pipeline_set(pairs)   # [True, True, ...]
+
+keys = [f"k{i}" for i in range(100)]
+values = client.pipeline_get(keys)      # ["v0", "v1", ...]
+```
+
+| Method | Description |
+|--------|-------------|
+| `set(key, value)` | Single SET |
+| `get(key)` | Single GET (None if missing) |
+| `delete(*keys)` | Delete keys, returns count |
+| `exists(*keys)` | Check existence, returns count |
+| `keys()` | Return all keys |
+| `pipeline_set(pairs)` | Batch SET list of (key, value) tuples |
+| `pipeline_get(keys)` | Batch GET list of keys |
+| `pipeline_delete(keys)` | Batch DELETE list of keys |
+
+**Location:** `clients/python/antzkv/__init__.py`
+
+### 8.2 Java
+
+```java
+try (AntzKVClient client = new AntzKVClient("127.0.0.1", 6379)) {
+    client.connect();
+    client.set("name", "Alice");
+    System.out.println(client.get("name"));
+    client.delete("name");
+}
+```
+
+**Connection pool:**
+
+```java
+try (AntzKVClient.Pool pool = new AntzKVClient.Pool("127.0.0.1", 6379, 4)) {
+    AntzKVClient c = pool.acquire();
+    c.set("key", "value");
+    pool.release(c);
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `set(key, value)` | Single SET |
+| `get(key)` | Single GET (null if missing) |
+| `delete(keys...)` | Delete keys, returns count |
+| `exists(keys...)` | Check existence, returns count |
+| `keys()` | Return all keys |
+
+**Location:** `clients/java/src/main/java/com/antzkv/AntzKVClient.java`
+
+---
+
+## 9. Performance
+
+### Benchmark Results
+
+| Scenario | Throughput | Latency p99 |
+|----------|-----------|-------------|
+| Sync 1:1 (default client) | **~497 TPS** | ~2.8ms |
+| Pipeline batch=50 (Python) | **~56,000 TPS** | ~5ms |
+| Raw socket pipeline (theoretical max) | **~87,000 TPS** | ~2ms |
+
+### How to reproduce
+
+```bash
+# Start a standalone server
+./build/antzkv-server -p 6301
+
+# Quick benchmark
+python3 quick_bench.py
+```
+
+Expected output:
+```
+Pipeline SET: 5000 ops in 0.089s = 55,972 TPS
+Pipeline GET: 1000 ops in 0.013s = 74,582 TPS
+```
+
+### Bottlenecks & Roadmap
+
+| # | Bottleneck | Fix | Priority |
+|---|-----------|-----|----------|
+| 1 | Protocol sync 1:1 | ✅ Pipeline client (DONE) | High |
+| 2 | Thread creation per client | Thread pool server | High |
+| 3 | Global hash table lock | Sharded hash table (16 shards) | High |
+| 4 | Memory allocation | Arena allocator | Medium |
+| 5 | Replication lock | Lock-free SPSC ring buffer | Medium |
+
+**Full report:** `PERFORMANCE_REPORT.md`
 
 ---
 
