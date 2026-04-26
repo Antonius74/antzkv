@@ -124,7 +124,13 @@ On `kv_open()`, the file is read and every entry is re-inserted via `kv_set_meta
 
 ## 3. Cluster Mode
 
-`antzkv-server` can join a **replicated cluster** by supplying a configuration file with the node list. Any write (`SET`/`DEL`) is asynchronously propagated to all known peers.
+`antzkv-server` can join a cluster by supplying a configuration file with the node list.
+
+> ⚠️ **WARNING: Cross-node replication is currently BROKEN.** Writes (`SET`/`DEL`) from one node are **NOT** propagated to other nodes in real-time. Multiple nodes can start with the same config, but each node is an **independent island**.
+>
+> If you write `SET x y` on node alpha (port 6301), reading `GET x` on node beta (port 6302) will return `(nil)`.
+>
+> **Workaround**: Use a load balancer (HAProxy, Nginx) in front of multiple standalone nodes, or run replication at the application layer (write the same key to all nodes from your client).
 
 ### 3.1 Configuration
 
