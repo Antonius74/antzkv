@@ -75,9 +75,11 @@ int main(int argc, char **argv) {
         }
         send_cmd(sock, cmd);
         char resp[BUFFER_SIZE];
-        if (recv_line(sock, resp, sizeof(resp)) >= 0)
-            printf("%s\n", resp);
-        close(sock);
+        if (recv_line(sock, resp, sizeof(resp)) >= 0) {
+            if (resp[0] != '\0') {
+                puts(resp);
+            }
+        }
         return 0;
     }
 
