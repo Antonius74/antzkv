@@ -156,6 +156,23 @@ id=gamma host=192.168.1.12 port=6379:16380 replicate=auto
 * **Sync on join**: when an incoming peer is recognised, it can request a `SYNC_REQ`; the responding node streams the entire keyspace via `SNAPSHOT` / `SET` messages.
 * **Node IDs**: each server persists a unique ID in `.nodeid.<port>` in the working directory.
 
+### ⚠️ IMPORTANT: Cluster Replication Status
+
+The cluster networking module (`src/cluster/cluster.c`) establishes TCP mesh connections between nodes, but **cross-node data replication is currently non-functional**. This is a known architectural bug — see [issue #1](https://github.com/Antonius74/antzkv/issues) for details.
+
+**What works:**
+- Multiple nodes start successfully
+- Heartbeat messages are exchanged
+- The mesh TCP overlay is active
+- Data persists on individual nodes
+
+**What does NOT work:**
+- Automatic replication of SET/DEL from one node to another
+- SYNC_REQ / SNAPSHOT full sync
+- Last-Write-Wins conflict resolution across nodes
+
+**Workaround:** For multi-node read scaling, deploy a load balancer (e.g., HAProxy, Nginx) in front of individual nodes and write to one node (or use client-side replication).
+
 ### 3.3 Convenience scripts
 
 Two helper scripts are provided:
