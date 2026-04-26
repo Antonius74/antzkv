@@ -1,29 +1,24 @@
 """
-AntzKV - Native Python Client Library
+AntzKV - Native Python Client Library v2.0
 
 Thread-safe TCP client for antzkv key-value store.
-No CLI subprocesses - pure socket communication.
-
-Usage:
-    from antzkv import AntzKVClient
-
-    client = AntzKVClient('127.0.0.1', 6379)
-    client.connect()
-    client.set('name', 'Alice')
-    print(client.get('name'))  # Alice
-    client.close()
+Features:
+  - Single-roundtrip CRUD
+  - Automatic command pipelining for bulk writes
+  - Connection pool
 """
 
 import socket
 import threading
-from typing import Optional, List
+import collections
+from typing import Optional, List, Tuple
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __all__ = ["AntzKVClient", "AntzKVPool"]
 
 
 class AntzKVClient:
-    """Thread-safe native TCP client for antzkv."""
+    """Thread-safe native TCP client for antzkv with pipelining support."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 6379):
         self.host = host
@@ -33,7 +28,6 @@ class AntzKVClient:
         self._buf = b""
 
     def connect(self, timeout: Optional[float] = None) -> None:
-        """Open TCP connection to the server."""
         with self._lock:
             if self._sock:
                 return
@@ -41,9 +35,9 @@ class AntzKVClient:
             if timeout is not None:
                 self._sock.settimeout(timeout)
             self._sock.connect((self.host, self.port))
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def close(self) -> None:
-        """Close the connection."""
         with self._lock:
             if self._sock:
                 try:
@@ -63,83 +57,102 @@ class AntzKVClient:
         return False
 
     def _send(self, data: str) -> None:
-        """Send a line (thread-safe)."""
         if self._sock is None:
             raise ConnectionError("Not connected. Call connect() first.")
         self._sock.sendall((data + "\n").encode("utf-8"))
 
-    def _recv_line(self) -> str:
-        """Read one \\n-terminated line (thread-safe)."""
+    def _recv_lines(self, n: int) -> List[str]:
+        """Read exactly n \n-terminated lines."""
         if self._sock is None:
             raise ConnectionError("Not connected. Call connect() first.")
-        while b"\n" not in self._buf:
-            chunk = self._sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("Server closed connection unexpectedly.")
-            self._buf += chunk
-        idx = self._buf.index(b"\n")
-        line = self._buf[:idx].decode("utf-8")
-        self._buf = self._buf[idx + 1:]
-        # strip \\r if present
-        if line.endswith("\r"):
-            line = line[:-1]
-        return line
+        lines = []
+        while len(lines) < n:
+            while b"\n" not in self._buf:
+                chunk = self._sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("Server closed connection unexpectedly.")
+                self._buf += chunk
+            idx = self._buf.index(b"\n")
+            line = self._buf[:idx].decode("utf-8")
+            self._buf = self._buf[idx + 1:]
+            if line.endswith("\r"):
+                line = line[:-1]
+            lines.append(line)
+        return lines
+
+    # ---- single op ----
 
     def _execute(self, cmd: str) -> str:
-        """Send command and return reply (atomic under lock)."""
         with self._lock:
             self._send(cmd)
-            return self._recv_line()
-
-    # ---- CRUD ----
+            return self._recv_lines(1)[0]
 
     def set(self, key: str, value: str) -> bool:
-        """Store value under key. Returns True on success."""
         return self._execute(f"SET {key} {value}") == "OK"
 
     def get(self, key: str) -> Optional[str]:
-        """Retrieve value. Returns None if key does not exist."""
         r = self._execute(f"GET {key}")
         return None if r == "(nil)" else r
 
     def delete(self, *keys: str) -> int:
-        """Delete one or more keys. Returns number of keys removed."""
-        if not keys:
-            return 0
+        if not keys: return 0
         r = self._execute(f"DEL {' '.join(keys)}")
-        try:
-            return int(r)
-        except ValueError:
-            return 0
+        try: return int(r)
+        except ValueError: return 0
 
     def exists(self, *keys: str) -> int:
-        """Check existence. Returns count of existing keys."""
-        if not keys:
-            return 0
+        if not keys: return 0
         r = self._execute(f"EXISTS {' '.join(keys)}")
-        try:
-            return int(r)
-        except ValueError:
-            return 0
+        try: return int(r)
+        except ValueError: return 0
 
     def keys(self) -> List[str]:
-        """Return all keys. Returns empty list if none."""
         r = self._execute("KEYS")
-        if r == "(empty)":
-            return []
-        return r.split(" ")
+        return [] if r == "(empty)" else r.split(" ")
 
     def save(self) -> bool:
-        """Explicit snapshot to disk. Returns True on success."""
         return self._execute("SAVE") == "OK"
 
     def ping(self) -> bool:
-        """Health check. Returns True if server responds PONG."""
         return self._execute("PING") == "PONG"
 
     def quit(self) -> bool:
-        """Gracefully close server-side connection."""
         return self._execute("QUIT") == "OK"
+
+    # ---- pipeline bulk ops ----
+
+    def pipeline_set(self, pairs: List[Tuple[str, str]]) -> List[bool]:
+        """Send multiple SETs in a single network roundtrip."""
+        if not pairs: return []
+        n = len(pairs)
+        with self._lock:
+            for k, v in pairs:
+                self._send(f"SET {k} {v}")
+            replies = self._recv_lines(n)
+        return [r == "OK" for r in replies]
+
+    def pipeline_get(self, keys: List[str]) -> List[Optional[str]]:
+        """Send multiple GETs in a single network roundtrip."""
+        if not keys: return []
+        n = len(keys)
+        with self._lock:
+            for k in keys:
+                self._send(f"GET {k}")
+            replies = self._recv_lines(n)
+        return [None if r == "(nil)" else r for r in replies]
+
+    def pipeline_delete(self, keys: List[str]) -> List[int]:
+        if not keys: return []
+        n = len(keys)
+        with self._lock:
+            for k in keys:
+                self._send(f"DEL {k}")
+            replies = self._recv_lines(n)
+        out = []
+        for r in replies:
+            try: out.append(int(r))
+            except ValueError: out.append(0)
+        return out
 
 
 class AntzKVPool:
@@ -149,7 +162,7 @@ class AntzKVPool:
         self._host = host
         self._port = port
         self._size = size
-        self._pool: List[AntzKVClient] = []
+        self._pool: collections.deque = collections.deque()
         self._semaphore = threading.Semaphore(size)
         self._lock = threading.Lock()
 
