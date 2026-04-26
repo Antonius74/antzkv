@@ -24,8 +24,9 @@ typedef enum {
 
 typedef struct cluster_peer {
     cluster_node_conf_t info;
-    int fd;               /* connessione TCP cluster (-1 = non connesso) */
-    int incoming;         /* 1 se connessione incoming */
+    int out_fd;           /* connessione outgoing verso il peer */
+    int in_fd;            /* connessione incoming dal peer */
+    int identified;       /* 1 se ha inviato JOIN valido */
     uint64_t last_seen;   /* msec dall'epoch */
     uint64_t last_version;
     int alive;

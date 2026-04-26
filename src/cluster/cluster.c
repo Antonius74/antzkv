@@ -25,14 +25,18 @@ static int set_nonblock(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void cluster_send_msg(cluster_peer_t *peer, const char *msg) {
-    if (peer->fd < 0 || !peer->alive) return;
+static void cluster_send(cluster_peer_t *peer, const char *msg) {
+    /* Send on out_fd if available */
+    int fd = -1;
+    pthread_mutex_lock(&peer->lock);
+    if (peer->out_fd >= 0 && peer->alive) fd = peer->out_fd;
+    pthread_mutex_unlock(&peer->lock);
+    if (fd < 0) return;
     size_t len = strlen(msg);
-    if (write(peer->fd, msg, len) < (ssize_t)len) {
+    if (write(fd, msg, len) < (ssize_t)len) {
         pthread_mutex_lock(&peer->lock);
         peer->alive = 0;
-        close(peer->fd);
-        peer->fd = -1;
+        if (peer->out_fd >= 0) { close(peer->out_fd); peer->out_fd = -1; }
         pthread_mutex_unlock(&peer->lock);
     }
 }
@@ -55,7 +59,10 @@ static void add_peer(cluster_state_t *cs, cluster_peer_t *peer) {
 }
 
 static int connect_peer(cluster_state_t *cs, cluster_peer_t *peer) {
-    if (peer->fd >= 0) return 0;
+    pthread_mutex_lock(&peer->lock);
+    if (peer->out_fd >= 0) { pthread_mutex_unlock(&peer->lock); return 0; }
+    pthread_mutex_unlock(&peer->lock);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_in addr;
@@ -69,10 +76,14 @@ static int connect_peer(cluster_state_t *cs, cluster_peer_t *peer) {
         close(fd); return -1;
     }
     set_nonblock(fd);
-    peer->fd = fd;
+
+    pthread_mutex_lock(&peer->lock);
+    peer->out_fd = fd;
     peer->last_seen = msec_now();
     peer->alive = 1;
-    /* invio JOIN */
+    pthread_mutex_unlock(&peer->lock);
+
+    /* Send JOIN */
     char msg[256];
     int cp = (cs->conf && cs->conf->my_node >= 0 && (size_t)cs->conf->my_node < cs->conf->node_count)
              ? cs->conf->nodes[cs->conf->my_node].client_port : 0;
@@ -149,7 +160,7 @@ static void *repl_thread(void *arg) {
         pthread_rwlock_rdlock(&cs->peers_lock);
         cluster_peer_t *p = cs->peers;
         while (p) {
-            cluster_send_msg(p, item);
+            cluster_send(p, item);
             p = p->next;
         }
         pthread_rwlock_unlock(&cs->peers_lock);
@@ -173,11 +184,8 @@ static void *hb_thread(void *arg) {
         pthread_rwlock_rdlock(&cs->peers_lock);
         cluster_peer_t *p = cs->peers;
         while (p) {
-            if (p->fd < 0 || !p->alive) {
-                connect_peer(cs, p);
-            }
-            if (p->fd >= 0 && p->alive)
-                cluster_send_msg(p, msg);
+            connect_peer(cs, p);
+            cluster_send(p, msg);
             p = p->next;
         }
         pthread_rwlock_unlock(&cs->peers_lock);
@@ -185,12 +193,23 @@ static void *hb_thread(void *arg) {
         /* cleanup dead peers */
         uint64_t now = msec_now();
         pthread_rwlock_wrlock(&cs->peers_lock);
+        cluster_peer_t **prev = &cs->peers;
         p = cs->peers;
         while (p) {
-            if (p->alive && now - p->last_seen > CLUSTER_DEAD_MS) {
-                p->alive = 0;
-                if (p->fd >= 0) { close(p->fd); p->fd = -1; }
+            pthread_mutex_lock(&p->lock);
+            if (p->alive) {
+                uint64_t last = p->last_seen;
+                pthread_mutex_unlock(&p->lock);
+                if (now - last > CLUSTER_DEAD_MS) {
+                    pthread_mutex_lock(&p->lock);
+                    p->alive = 0;
+                    if (p->out_fd >= 0) { close(p->out_fd); p->out_fd = -1; }
+                    pthread_mutex_unlock(&p->lock);
+                }
+            } else {
+                pthread_mutex_unlock(&p->lock);
             }
+            prev = &p->next;
             p = p->next;
         }
         pthread_rwlock_unlock(&cs->peers_lock);
@@ -198,13 +217,143 @@ static void *hb_thread(void *arg) {
     return NULL;
 }
 
-/* ---- incoming cluster connection handler wrapper ---- */
+/* ---- incoming cluster connection handler ---- */
+
+static void register_incoming_fd(cluster_state_t *cs, const char *id, int fd) {
+    pthread_rwlock_wrlock(&cs->peers_lock);
+    cluster_peer_t *peer = find_peer(cs, id);
+    if (peer) {
+        pthread_mutex_lock(&peer->lock);
+        peer->in_fd = fd;
+        peer->last_seen = msec_now();
+        peer->alive = 1;
+        pthread_mutex_unlock(&peer->lock);
+    }
+    pthread_rwlock_unlock(&cs->peers_lock);
+}
+
 typedef struct {
     cluster_state_t *cs;
     int fd;
 } handle_args_t;
 
-static void *handle_client(void *varg);
+static void *handle_client(void *varg) {
+    handle_args_t *ha = (handle_args_t *)varg;
+    cluster_state_t *cs = ha->cs;
+    int fd = ha->fd;
+    free(ha);
+
+    char rx[4096];
+    size_t rxlen = 0;
+    char line[4096];
+    int identified = 0;
+    char peer_id[16] = {0};
+
+    while (!cs->stop) {
+        ssize_t n = read(fd, rx + rxlen, sizeof(rx) - rxlen - 1);
+        if (n <= 0) {
+            if (n < 0 && errno == EAGAIN) { usleep(10000); continue; }
+            break;
+        }
+        rxlen += n;
+        rx[rxlen] = '\0';
+
+        char *p = rx;
+        char *nl;
+        while ((nl = strchr(p, '\n')) != NULL) {
+            size_t linelen = nl - p;
+            if (linelen >= sizeof(line)) linelen = sizeof(line) - 1;
+            memcpy(line, p, linelen);
+            line[linelen] = '\0';
+
+            cluster_cmd_t cmd;
+            char rest[4096];
+            cmd = cluster_parse_cmd(line, rest, sizeof(rest));
+
+            if (cmd == CMD_HEARTBEAT) {
+                unsigned long long v;
+                if (sscanf(rest, "%llu", &v) == 1) {
+                    pthread_rwlock_wrlock(&cs->peers_lock);
+                    cluster_peer_t *peer = cs->peers;
+                    while (peer) {
+                        pthread_mutex_lock(&peer->lock);
+                        /* Match by in_fd or by already-known id */
+                        if (peer->in_fd == fd || (identified && strcmp(peer->info.id, peer_id) == 0)) {
+                            peer->last_seen = msec_now();
+                            if (peer->in_fd < 0) peer->in_fd = fd;
+                            peer->last_version = v;
+                            pthread_mutex_unlock(&peer->lock);
+                            break;
+                        }
+                        pthread_mutex_unlock(&peer->lock);
+                        peer = peer->next;
+                    }
+                    pthread_rwlock_unlock(&cs->peers_lock);
+                }
+            } else if (cmd == CMD_SET) {
+                kv_meta_t meta;
+                char key[4096] = {0}, value[4096] = {0};
+                if (parse_meta(rest, &meta, key, value)) {
+                    kv_set_meta(cs->db, key, value, &meta);
+                }
+            } else if (cmd == CMD_DEL) {
+                kv_meta_t meta;
+                char key[4096] = {0};
+                if (parse_meta(rest, &meta, key, NULL)) {
+                    kv_del_meta(cs->db, key, &meta);
+                }
+            } else if (cmd == CMD_JOIN) {
+                char id[16] = {0};
+                int client_port;
+                if (parse_join(rest, id, sizeof(id), &client_port)) {
+                    identified = 1;
+                    strncpy(peer_id, id, 15);
+                    peer_id[15] = '\0';
+                    register_incoming_fd(cs, id, fd);
+                }
+            } else if (cmd == CMD_SYNC_REQ) {
+                char **keys = NULL;
+                size_t kcount = 0;
+                if (kv_keys(cs->db, &keys, &kcount) == 0) {
+                    char msg[CLUSTER_MSG_SIZE];
+                    uint64_t ver = kv_db_version(cs->db);
+                    kv_meta_t meta = {ver, 0, ""};
+                    cluster_build_msg(msg, sizeof(msg), CMD_SNAPSHOT, NULL, NULL, &meta);
+                    write(fd, msg, strlen(msg));
+
+                    for (size_t i = 0; i < kcount && !cs->stop; ++i) {
+                        kv_meta_t m;
+                        char *v = kv_get_meta(cs->db, keys[i], &m);
+                        if (v) {
+                            cluster_build_msg(msg, sizeof(msg), CMD_SET, keys[i], v, &m);
+                            write(fd, msg, strlen(msg));
+                            free(v);
+                        }
+                    }
+                    kv_keys_free(keys, kcount);
+                    cluster_build_msg(msg, sizeof(msg), CMD_SNAPSHOT_END, NULL, NULL, NULL);
+                    write(fd, msg, strlen(msg));
+                }
+            }
+            p = nl + 1;
+        }
+        size_t remaining = rx + rxlen - p;
+        memmove(rx, p, remaining);
+        rxlen = remaining;
+    }
+    close(fd);
+    /* If this fd was someone's in_fd, clear it */
+    pthread_rwlock_wrlock(&cs->peers_lock);
+    cluster_peer_t *peer = cs->peers;
+    while (peer) {
+        pthread_mutex_lock(&peer->lock);
+        if (peer->in_fd == fd) { peer->in_fd = -1; }
+        pthread_mutex_unlock(&peer->lock);
+        peer = peer->next;
+    }
+    pthread_rwlock_unlock(&cs->peers_lock);
+    return NULL;
+}
 
 /* ---- thread: cluster bus listener ---- */
 static void *bus_listener_thread(void *arg) {
@@ -246,112 +395,6 @@ static void *bus_listener_thread(void *arg) {
     return NULL;
 }
 
-static void *handle_client(void *varg) {
-    handle_args_t *ha = (handle_args_t *)varg;
-    cluster_state_t *cs = ha->cs;
-    int fd = ha->fd;
-    free(ha);
-
-    char rx[4096];
-    size_t rxlen = 0;
-    char line[4096];
-
-    while (!cs->stop) {
-        ssize_t n = read(fd, rx + rxlen, sizeof(rx) - rxlen - 1);
-        if (n <= 0) {
-            if (n < 0 && errno == EAGAIN) { usleep(10000); continue; }
-            break;
-        }
-        rxlen += n;
-        rx[rxlen] = '\0';
-
-        char *p = rx;
-        char *nl;
-        while ((nl = strchr(p, '\n')) != NULL) {
-            size_t linelen = nl - p;
-            if (linelen >= sizeof(line)) linelen = sizeof(line) - 1;
-            memcpy(line, p, linelen);
-            line[linelen] = '\0';
-
-            cluster_cmd_t cmd;
-            char rest[4096];
-            cmd = cluster_parse_cmd(line, rest, sizeof(rest));
-
-            if (cmd == CMD_HEARTBEAT) {
-                unsigned long long v;
-                if (sscanf(rest, "%llu", &v) == 1) {
-                    pthread_rwlock_wrlock(&cs->peers_lock);
-                    cluster_peer_t *peer = cs->peers;
-                    while (peer) {
-                        if (peer->fd == fd || peer->fd < 0) {
-                            peer->last_seen = msec_now();
-                            if (peer->fd < 0) peer->fd = fd;
-                            peer->last_version = v;
-                            break;
-                        }
-                        peer = peer->next;
-                    }
-                    pthread_rwlock_unlock(&cs->peers_lock);
-                }
-            } else if (cmd == CMD_SET) {
-                kv_meta_t meta;
-                char key[4096] = {0}, value[4096] = {0};
-                if (parse_meta(rest, &meta, key, value)) {
-                    kv_set_meta(cs->db, key, value, &meta);
-                }
-            } else if (cmd == CMD_DEL) {
-                kv_meta_t meta;
-                char key[4096] = {0};
-                if (parse_meta(rest, &meta, key, NULL)) {
-                    kv_del_meta(cs->db, key, &meta);
-                }
-            } else if (cmd == CMD_JOIN) {
-                char id[16] = {0};
-                int client_port;
-                if (parse_join(rest, id, sizeof(id), &client_port)) {
-                    pthread_rwlock_wrlock(&cs->peers_lock);
-                    cluster_peer_t *peer = find_peer(cs, id);
-                    if (peer) {
-                        peer->fd = fd;
-                        peer->last_seen = msec_now();
-                        peer->alive = 1;
-                    }
-                    pthread_rwlock_unlock(&cs->peers_lock);
-                }
-            } else if (cmd == CMD_SYNC_REQ) {
-                char **keys = NULL;
-                size_t kcount = 0;
-                if (kv_keys(cs->db, &keys, &kcount) == 0) {
-                    char msg[CLUSTER_MSG_SIZE];
-                    uint64_t ver = kv_db_version(cs->db);
-                    kv_meta_t meta = {ver, 0, ""};
-                    cluster_build_msg(msg, sizeof(msg), CMD_SNAPSHOT, NULL, NULL, &meta);
-                    write(fd, msg, strlen(msg));
-
-                    for (size_t i = 0; i < kcount && !cs->stop; ++i) {
-                        kv_meta_t m;
-                        char *v = kv_get_meta(cs->db, keys[i], &m);
-                        if (v) {
-                            cluster_build_msg(msg, sizeof(msg), CMD_SET, keys[i], v, &m);
-                            write(fd, msg, strlen(msg));
-                            free(v);
-                        }
-                    }
-                    kv_keys_free(keys, kcount);
-                    cluster_build_msg(msg, sizeof(msg), CMD_SNAPSHOT_END, NULL, NULL, NULL);
-                    write(fd, msg, strlen(msg));
-                }
-            }
-            p = nl + 1;
-        }
-        size_t remaining = rx + rxlen - p;
-        memmove(rx, p, remaining);
-        rxlen = remaining;
-    }
-    close(fd);
-    return NULL;
-}
-
 /* ---- public ---- */
 cluster_state_t *cluster_init(cluster_conf_t *conf, kv_table_t *db) {
     cluster_state_t *cs = calloc(1, sizeof(*cs));
@@ -373,7 +416,8 @@ cluster_state_t *cluster_init(cluster_conf_t *conf, kv_table_t *db) {
         cluster_peer_t *peer = calloc(1, sizeof(*peer));
         if (!peer) continue;
         peer->info = conf->nodes[i];
-        peer->fd = -1;
+        peer->out_fd = -1;
+        peer->in_fd = -1;
         peer->alive = 0;
         pthread_mutex_init(&peer->lock, NULL);
         add_peer(cs, peer);
@@ -389,6 +433,7 @@ cluster_state_t *cluster_init(cluster_conf_t *conf, kv_table_t *db) {
     pthread_create(&cs->repl_daemon, NULL, repl_thread, cs);
     pthread_create(&cs->heartbeat_daemon, NULL, hb_thread, cs);
 
+    /* Connect initial peers (outgoing) */
     pthread_rwlock_rdlock(&cs->peers_lock);
     cluster_peer_t *p = cs->peers;
     while (p) {
@@ -414,7 +459,10 @@ void cluster_shutdown(cluster_state_t *cs) {
     cluster_peer_t *p = cs->peers;
     while (p) {
         cluster_peer_t *n = p->next;
-        if (p->fd >= 0) close(p->fd);
+        pthread_mutex_lock(&p->lock);
+        if (p->out_fd >= 0) close(p->out_fd);
+        if (p->in_fd >= 0) close(p->in_fd);
+        pthread_mutex_unlock(&p->lock);
         pthread_mutex_destroy(&p->lock);
         free(p);
         p = n;
