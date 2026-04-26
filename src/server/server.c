@@ -284,6 +284,10 @@ int main(int argc, char **argv) {
     if (srv < 0) { perror("socket"); return 1; }
     int opt = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef __APPLE__
+    /* macOS: SO_REUSEPORT permette bind rapido dopo crash/suspend */
+    setsockopt(srv, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -291,8 +295,23 @@ int main(int argc, char **argv) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    int retries = 5;
+    while (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0 && retries > 0) {
+        if (errno == EADDRINUSE) {
+            fprintf(stderr, "bind port %d: Address already in use, retrying in 1s...\n", port);
+            sleep(1);
+            retries--;
+            continue;
+        }
         perror("bind"); return 1;
+    }
+    if (retries == 0) {
+        fprintf(stderr, "Could not bind to port %d after 5 attempts.\n", port);
+        fprintf(stderr, "Possible causes:\n");
+        fprintf(stderr, "  - Another process is using port %d\n", port);
+        fprintf(stderr, "  - A previous process was suspended (Ctrl+Z). Use 'pkill antzkv-server' or 'kill -9 PID'\n");
+        fprintf(stderr, "  - Socket in TIME_WAIT. Wait 30-60s or use a different port.\n");
+        return 1;
     }
     listen(srv, 64);
     printf("antzkv-server listening on port %d\n", port);
