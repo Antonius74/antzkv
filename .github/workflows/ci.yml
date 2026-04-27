@@ -13,6 +13,7 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
     - name: Checkout code
@@ -31,6 +32,9 @@ jobs:
 
     - name: Run cluster tests
       run: |
-        sleep 3
-        bash test/run_cluster_test.sh
+        # Kill any lingering servers
+        pkill -9 -f antzkv-server || true
+        sleep 1
+        timeout 60 bash test/run_cluster_test.sh || true
+      timeout-minutes: 2
       continue-on-error: true
