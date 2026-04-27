@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, cluster ]
+  pull_request:
+    branches: [ main, cluster ]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libedit-dev
+
+    - name: Build project
+      run: make clean && make
+
+    - name: Run functional tests
+      run: bash test/run_test.sh
+
+    - name: Run cluster tests
+      run: bash test/run_cluster_test.sh

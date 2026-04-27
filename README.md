@@ -4,6 +4,8 @@
 
 **New in cluster branch:** multi-node replication with automatic mesh networking, Last-Write-Wins conflict resolution, and configurable per-node persistence.
 
+[![CI](https://github.com/Antonius74/antzkv/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Antonius74/antzkv/actions/workflows/ci.yml)
+
 ---
 
 ## Table of Contents
