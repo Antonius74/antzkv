@@ -1,7 +1,11 @@
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -Iinclude -Isrc -pthread -DCLUSTER_ENABLED
 LDFLAGS = -pthread
-LDFLAGS_CLI = -pthread -ledit
+ifeq ($(shell uname),Linux)
+  LDFLAGS_CLI = -pthread -lreadline
+else
+  LDFLAGS_CLI := -pthread -ledit
+endif
 
 SRC_CORE = src/core/kvdb.c
 SRC_SERVER = src/server/server.c
@@ -33,7 +37,7 @@ build/antzkv-server: $(OBJ_CORE) $(OBJ_SERVER) $(OBJ_CLUSTER)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 build/antzkv-cli: $(OBJ_CORE) $(OBJ_CLI)
-	$(CC) $(LDFLAGS_CLI) $^ -o $@
+	$(CC) $^ $(LDFLAGS_CLI) -o $@
 
 build/core build/server build/cli build/cluster:
 	mkdir -p $@

@@ -24,7 +24,7 @@ jobs:
         sudo apt-get install -y build-essential libedit-dev libreadline-dev
 
     - name: Build project
-      run: make clean && make LDFLAGS_CLI="-pthread -lreadline"
+      run: make clean && make
 
     - name: Run functional tests
       run: bash test/run_test.sh
