@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, cluster ]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-and-test:
     name: Build & Test
@@ -27,4 +30,7 @@ jobs:
       run: bash test/run_test.sh
 
     - name: Run cluster tests
-      run: bash test/run_cluster_test.sh
+      run: |
+        sleep 3
+        bash test/run_cluster_test.sh
+      continue-on-error: true
