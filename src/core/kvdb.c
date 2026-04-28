@@ -1244,24 +1244,30 @@ void pubsub_unsubscribe_all(pubsub_mgr_t *m, int fd) {
 
 int pubsub_publish(pubsub_mgr_t *m, const char *channel, const char *msg) {
     int count = 0;
+
+    /* Build the message once */
+    char buf[BULK_MSG_MAX];
+    int len = snprintf(buf, sizeof(buf),
+                       "*3\r\n$7\r\nmessage\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       strlen(channel), channel,
+                       strlen(msg), msg);
+
+    /* Collect subscriber fds + wlocks under read-lock, then release
+       before doing blocking send() — avoids head-of-line blocking. */
+    #define MAX_BATCH 128
+    int fds[MAX_BATCH];
+    pthread_mutex_t *wlocks[MAX_BATCH];
+    int nsubs = 0;
+
     pthread_rwlock_rdlock(&m->lock);
     channel_entry_t *ch = m->channels;
     while (ch) {
         if (strcmp(ch->name, channel) == 0) {
             client_sub_t *cs = ch->subs;
-            while (cs) {
-                if (cs->wlock) pthread_mutex_lock(cs->wlock);
-                char buf[BULK_MSG_MAX];
-                int len = snprintf(buf, sizeof(buf),
-                                   "*3\r\n$7\r\nmessage\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                                   strlen(channel), channel,
-                                   strlen(msg), msg);
-                if (cs->fd >= 0) {
-                    ssize_t sent = send(cs->fd, buf, len,
-                                        MSG_NOSIGNAL);
-                    if (sent >= 0) ++count;
-                }
-                if (cs->wlock) pthread_mutex_unlock(cs->wlock);
+            while (cs && nsubs < MAX_BATCH) {
+                fds[nsubs]   = cs->fd;
+                wlocks[nsubs] = cs->wlock;
+                ++nsubs;
                 cs = cs->next;
             }
             break;
@@ -1269,6 +1275,17 @@ int pubsub_publish(pubsub_mgr_t *m, const char *channel, const char *msg) {
         ch = ch->next;
     }
     pthread_rwlock_unlock(&m->lock);
+
+    /* Now send outside the pubsub lock */
+    for (int i = 0; i < nsubs; ++i) {
+        if (wlocks[i]) pthread_mutex_lock(wlocks[i]);
+        if (fds[i] >= 0) {
+            ssize_t sent = send(fds[i], buf, (size_t)len, MSG_NOSIGNAL);
+            if (sent >= 0) ++count;
+        }
+        if (wlocks[i]) pthread_mutex_unlock(wlocks[i]);
+    }
+
     return count;
 }
 
